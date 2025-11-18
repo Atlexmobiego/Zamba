@@ -1,0 +1,161 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "zamba"
+version = "2.7.2"
+authors = ["Vivian"]
+  {name = "DrivenData", email = "info@drivendata.org"}
+]
+description = "Zamba is a command line tool and Python package to identify animals in camera trap videos and train custom models for new species and habitats."
+readme = "README.md"
+license = {text = "MIT License"}
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+requires-python = ">=3.11, <3.14"
+dependencies = [
+  "appdirs",
+  "click<=8.1.8",
+  "cloudpathlib[s3]",
+  "gitpython",
+  "loguru",
+  "mlflow-skinny",
+  "numpy<2.0.0",
+  "openpyxl",
+  "pandas>=2.0.0",
+  "pandas_path",
+  "pqdm",
+  "pyarrow>=23.0.0",
+  "pydantic<2.0.0",
+  "python-dotenv",
+  "pytorch-lightning>=2.0.0",
+  "scikit-learn",
+  "tensorboard",
+  "thop",
+  "timm",
+  "torch",
+  # Windows: allow <=2.7.1 or >2.10 (gloo bug in 2.7.2–2.10.0). PEP 440 uses AND only, so we exclude that range.
+  "torch>=2.7.1,!=2.7.2,!=2.7.3,!=2.8.0,!=2.8.1,!=2.8.2,!=2.9.0,!=2.9.1,!=2.10.0; sys_platform == 'win32'",
+  "torchinfo",
+  "torchvision>=0.10.0",
+  "tqdm",
+  "typer[all]",
+]
+
+[project.scripts]
+zamba = "zamba.cli:app"
+
+[project.optional-dependencies]
+video = [
+  "av",
+  "ffmpeg-python",
+  "future",
+  "fvcore",
+  "opencv-python-headless",
+  "pytorchvideo",
+  "pixeltable-yolox",
+]
+image = [
+  "megadetector>=10.0.0",
+  "Pillow>=9.0.0",
+]
+tests = [
+  "black>=26.1.0",
+  "coverage",
+  "flake8",
+  "nvidia-ml-py",
+  "psutil",
+  "pytest",
+  "pytest-coverage",
+  "pytest-duration-insights",
+  "pytest-mock",
+  "pytest-reportlog",
+  "pytest-xdist",
+  "wheel",
+]
+docs = [
+  "mike",
+  "mkdocs>=1.2.2",
+  "mkdocs-material>=7.3.4,<9.6",
+  "mkdocstrings[python]>=0.19.0,<=0.27",
+]
+
+[dependency-groups]
+dev = [
+  {include-group = "docs"},
+  {include-group = "tests"},
+]
+docs = [
+  "mike",
+  "mkdocs>=1.2.2",
+  "mkdocs-material>=7.3.4,<9.6",
+  "mkdocstrings[python]>=0.19.0,<=0.27",
+]
+tests = [
+  "black>=26.1.0",
+  "coverage",
+  "flake8",
+  "nvidia-ml-py",
+  "psutil",
+  "pytest",
+  "pytest-coverage",
+  "pytest-duration-insights",
+  "pytest-mock",
+  "pytest-reportlog",
+  "pytest-xdist",
+  "wheel",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/drivendataorg/zamba"
+"Documentation" = "https://zamba.drivendata.org/docs/stable/"
+"Bug Tracker" = "https://github.com/drivendataorg/zamba/issues"
+"Changelog" = "https://github.com/drivendataorg/zamba/blob/master/HISTORY.md"
+
+[tool.black]
+line-length = 99
+include = '\.pyi?$'
+exclude = '''
+(
+  /(
+      \.git
+    | \.venv
+  )/
+)
+'''
+
+[tool.ruff]
+line-length = 99
+
+[tool.coverage.run]
+source = ["zamba"]
+
+[tool.coverage.report]
+include = ["zamba/**/*.py"]
+omit = ["zamba/**/__*.py"]
+
+[tool.mypy]
+ignore_missing_imports = true
+allow_redefinition = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/"]
+addopts = "--cov-append --cov=zamba --cov-report=term --cov-report=html --cov-report=xml -n=auto --report-log reportlog.jsonl"
+markers = [
+  "video: tests that require the video extra (av, ffmpeg, opencv, yolox, pytorchvideo)",
+  "image: tests that require the image extra (megadetector, Pillow)",
+]
+
+[tool.uv]
+torch-backend = "auto"  # uv pip only: pick CUDA/ROCm/CPU PyTorch wheels for this machine
+override-dependencies = [
+  "protobuf>=3.20.2",  # megadetector dependencies pin too low, allow newer
+  "setuptools<82",  # setuptools 82 removed pkg_resources; ultralytics-yolov5 (megadetector) needs it
+]
