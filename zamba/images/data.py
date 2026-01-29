@@ -1,0 +1,254 @@
+import copy
+import os
+from itertools import repeat
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import pytorch_lightning as pl
+from loguru import logger
+
+try:
+    from megadetector.detection import run_detector
+except ModuleNotFoundError:
+    from detection import run_detector
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torchvision import transforms
+from tqdm import tqdm
+from tqdm.contrib.concurrent import process_map
+
+from zamba.images.bbox import (
+    absolute_bbox,
+    crop_to_bounding_box,
+    get_cache_filename,
+    load_image,
+    BboxLayout,
+)
+
+
+class ImageClassificationDataset(Dataset):
+    def __init__(self, data_dir: Path, annotations: pd.DataFrame, transform) -> None:
+        self.annotations = annotations
+        self.data_dir = data_dir
+
+        self.transform = transform
+
+    def _get_image_path(self, item) -> Path:
+        if "cached_bbox" in item:
+            return item["cached_bbox"]
+        else:
+            return self.data_dir / item["filepath"]
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, index):
+        item = self.annotations.iloc[index]
+        label = item["label"]
+
+        img_path = self._get_image_path(item)
+
+        with img_path.open("rb") as fp:
+            image = Image.open(fp)
+            image = image.convert("RGB")
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, int(label)
+
+
+class ImageClassificationDataModule(pl.LightningDataModule):
+    def __init__(
+        self,
+        data_dir: Path,
+        annotations: pd.DataFrame,
+        cache_dir: Path,
+        crop_images: bool,
+        batch_size: int = 16,
+        num_workers: Optional[int] = None,
+        train_transforms=None,
+        test_transforms=None,
+        detection_threshold: float = 0.2,
+        balanced_sampling: bool = False,
+    ) -> None:
+        super().__init__()
+        if train_transforms is None:
+            train_transforms = transforms.Compose([transforms.ToTensor()])
+        if test_transforms is None:
+            test_transforms = transforms.Compose([transforms.ToTensor()])
+
+        self.data_dir = data_dir
+        self.cache_dir = cache_dir
+
+        self.batch_size = batch_size
+        self.train_transforms = train_transforms
+        self.test_transforms = test_transforms
+        self.balanced_sampling = balanced_sampling
+
+        self.detection_threshold = detection_threshold
+
+        if num_workers is None:
+            num_workers = os.cpu_count()
+        self.num_workers = num_workers
+
+        self.annotations = annotations
+        if crop_images:
+            self.annotations = self.preprocess_annotations(annotations)
+
+    def preprocess_annotations(self, annotations: pd.DataFrame) -> pd.DataFrame:
+        num_annotations = len(annotations)
+
+        has_bbox_columns = all(
+            column in annotations.columns for column in ["x1", "x2", "y1", "y2"]
+        )
+
+        if not has_bbox_columns:
+            with_bbox_annotations = pd.DataFrame([])
+            no_bbox_annotations = annotations
+        else:
+            with_bbox_annotations = annotations[
+                annotations[["x1", "x2", "y1", "y2"]].notna().all(axis=1)
+            ]
+            no_bbox_annotations = annotations[
+                annotations[["x1", "x2", "y1", "y2"]].isna().any(axis=1)
+            ]
+
+        # Initialize empty dataframes for cropped and megadetector annotations
+        cropped_annotations = pd.DataFrame([])
+        megadetector_annotations = pd.DataFrame([])
+
+        if len(with_bbox_annotations) > 0:
+            logger.info(
+                f"Bboxes found in some of the annotations. Cropping images and save to cache_dir: {self.cache_dir}"
+            )
+
+            processed_annotations = process_map(
+                crop_to_bounding_box,
+                with_bbox_annotations.iterrows(),
+                repeat(self.cache_dir),
+                repeat(self.data_dir),
+                total=len(with_bbox_annotations),
+                desc="Cropping images",
+            )
+
+            cropped_annotations = pd.DataFrame(processed_annotations)
+        elif len(no_bbox_annotations) > 0:
+            processed_annotations = []
+            detector = run_detector.load_detector(
+                "MDV5A", force_cpu=(os.getenv("RUNNER_OS") == "macOS")
+            )
+            for _, row in tqdm(
+                no_bbox_annotations.iterrows(),
+                total=len(no_bbox_annotations),
+                desc="Running megadetector to extract bboxes.",
+            ):
+                filepath = (
+                    row["filepath"] if self.data_dir is None else self.data_dir / row["filepath"]
+                )
+                image = load_image(filepath)
+                result = detector.generate_detections_one_image(
+                    image, row["filepath"], detection_threshold=self.detection_threshold
+                )
+                for detection in result["detections"]:
+                    detection_row = copy.copy(row)
+                    detection_row["detection_conf"] = detection["conf"]
+                    detection_row["detection_category"] = detection["category"]
+                    bbox = absolute_bbox(image, detection["bbox"], bbox_layout=BboxLayout.XYWH)
+                    cache_path = self.cache_dir / get_cache_filename(
+                        detection_row["filepath"], bbox
+                    )
+                    if not cache_path.exists():
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        cropped_image = image.crop(bbox)
+                        with open(cache_path, "wb") as f:
+                            cropped_image.save(f)
+                    (
+                        detection_row["x1"],
+                        detection_row["x2"],
+                        detection_row["y1"],
+                        detection_row["y2"],
+                    ) = (bbox[0], bbox[2], bbox[1], bbox[3])
+                    detection_row["cached_bbox"] = cache_path.resolve().absolute()
+                    processed_annotations.append(detection_row)
+            megadetector_annotations = pd.DataFrame(processed_annotations)
+
+        logger.info(
+            f"Number of objects before preprocessing: {num_annotations}, "
+            f"number of objects after preprocessing: {len(cropped_annotations) + len(megadetector_annotations)}"
+        )
+
+        return pd.concat([cropped_annotations, megadetector_annotations])
+
+    def _build_balanced_sampler(self, train_annotations: pd.DataFrame) -> WeightedRandomSampler:
+        """Class-balanced sampler: weight each training example by the inverse frequency
+        of its class, so every class is drawn equally often in expectation.
+
+        ``num_samples`` is kept equal to the number of training rows, so one epoch sees the
+        same number of images as ``shuffle=True`` would (rare classes up-sampled with
+        replacement, common classes down-sampled). ``label`` has already been encoded to an
+        integer class index by the config's ``preprocess_labels`` step, so we can bincount
+        it directly. Every referenced class has count >= 1 (it appears in ``labels``), so no
+        weight divides by zero.
+        """
+        labels = train_annotations["label"].to_numpy()
+        counts = np.bincount(labels, minlength=int(labels.max()) + 1)
+        weights = 1.0 / counts[labels]
+        logger.info(
+            f"Class-balanced sampling: {(counts > 0).sum()} classes, "
+            f"per-class train count min={counts[counts > 0].min()} max={counts.max()}."
+        )
+        return WeightedRandomSampler(
+            torch.as_tensor(weights, dtype=torch.double),
+            num_samples=len(labels),
+            replacement=True,
+        )
+
+    def train_dataloader(self) -> DataLoader:
+        # reset_index so the sampler's positional indices line up with the dataset's
+        # positional (.iloc) lookups after the split filter.
+        train_annotations = self.annotations[self.annotations["split"] == "train"].reset_index(
+            drop=True
+        )
+        sampler = (
+            self._build_balanced_sampler(train_annotations) if self.balanced_sampling else None
+        )
+        return DataLoader(
+            ImageClassificationDataset(
+                self.data_dir,
+                train_annotations,
+                self.train_transforms,
+            ),
+            batch_size=self.batch_size,
+            # `sampler` and `shuffle` are mutually exclusive; shuffle only when unsampled.
+            shuffle=(sampler is None),
+            sampler=sampler,
+            num_workers=self.num_workers,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            ImageClassificationDataset(
+                self.data_dir,
+                self.annotations[self.annotations["split"] == "val"],
+                self.test_transforms,
+            ),
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        return DataLoader(
+            ImageClassificationDataset(
+                self.data_dir,
+                self.annotations[self.annotations["split"] == "test"],
+                self.test_transforms,
+            ),
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+        )
