@@ -1,0 +1,361 @@
+import logging
+import os
+import random
+import string
+from typing import Optional, Union
+
+# Keep tests on a single visible GPU to avoid nested DDP spawning under pytest-xdist.
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+from loguru import logger
+import pandas as pd
+from pathlib import Path
+import pytest
+from _pytest.logging import caplog as _caplog  # noqa: F401
+import torch
+
+from zamba.pytorch.transforms import zamba_image_model_transforms
+from zamba.pytorch_lightning.base_module import ZambaClassificationLightningModule
+from zamba.models.registry import register_model
+
+ASSETS_DIR = Path(__file__).parent / "assets"
+TEST_VIDEOS_DIR = ASSETS_DIR / "videos"
+
+random.seed(56745)
+
+# ---------------------------------------------------------------------------
+# Probe which optional extras are installed so we can skip test files whose
+# imports would fail.  collect_ignore is evaluated by pytest *before* it
+# tries to import the test modules, preventing ImportError during collection.
+# ---------------------------------------------------------------------------
+try:
+    import ffmpeg  # noqa: F401
+
+    _HAS_VIDEO = True
+except ImportError:
+    _HAS_VIDEO = False
+
+try:
+    import megadetector  # noqa: F401
+
+    _HAS_IMAGE = True
+except ImportError:
+    _HAS_IMAGE = False
+
+collect_ignore = []
+if not _HAS_VIDEO:
+    collect_ignore.extend(
+        [
+            "test_cli.py",
+            "test_config.py",
+            "test_datamodule.py",
+            "test_densepose.py",
+            "test_depth.py",
+            "test_filter_frames.py",
+            "test_instantiate_model.py",
+            "test_load_video_frames.py",
+            "test_megadetector_lite_yolox.py",
+            "test_model_manager.py",
+            "test_npy_cache.py",
+            "test_registry.py",
+            "test_determinism.py",
+            "test_zamba_video_classification_lightning_module.py",
+        ]
+    )
+if not _HAS_IMAGE:
+    collect_ignore.extend(
+        [
+            "test_images.py",
+            "test_image_file_handling.py",
+            "test_balanced_sampling.py",
+        ]
+    )
+
+# ---------------------------------------------------------------------------
+# Video-specific imports for fixtures (only when video extra is installed)
+# ---------------------------------------------------------------------------
+if _HAS_VIDEO:
+    from zamba.data.video import VideoLoaderConfig
+    from zamba.models.config import PredictConfig, TrainConfig
+    from zamba.models.model_manager import MODEL_MAPPING, train_model
+    from zamba.object_detection.yolox.megadetector_lite_yolox import MegadetectorLiteYoloX
+    from zamba.pytorch_lightning.video_modules import ZambaVideoClassificationLightningModule
+
+# ---------------------------------------------------------------------------
+# Dummy video model (only defined when video deps are available)
+# ---------------------------------------------------------------------------
+if _HAS_VIDEO:
+
+    @register_model
+    class DummyZambaVideoClassificationLightningModule(ZambaVideoClassificationLightningModule):
+        """A dummy model whose linear weights start out as all zeros."""
+
+        _default_model_name = "dummy_model"
+
+        def __init__(
+            self,
+            num_frames: int,
+            num_hidden: int,
+            finetune_from: Optional[Union[os.PathLike, str]] = None,
+            **kwargs,
+        ):
+            super().__init__(**kwargs)
+
+            if finetune_from is None:
+                backbone = torch.nn.Linear(num_frames, num_hidden)
+                torch.nn.init.ones_(backbone.weight)
+            else:
+                backbone = self.from_disk(finetune_from).backbone
+
+            for param in backbone.parameters():
+                param.requires_grad = False
+
+            head = torch.nn.Linear(num_hidden, self.num_classes)
+            torch.nn.init.zeros_(head.weight)
+
+            self.backbone = backbone
+            self.head = head
+            self.model = torch.nn.Sequential(
+                torch.nn.AdaptiveAvgPool3d(1), torch.nn.Flatten(), backbone, head
+            )
+
+            self.save_hyperparameters("num_frames", "num_hidden")
+
+        def forward(self, x, *args, **kwargs):
+            return self.model(x)
+
+    MODEL_MAPPING["DummyZambaVideoClassificationLightningModule"] = {
+        "transform": zamba_image_model_transforms()
+    }
+
+    class DummyTrainConfig(TrainConfig):
+        model_name: str
+        batch_size = 1
+        max_epochs = 1
+        # Keep test training single-device to avoid DDP spawning from xdist workers.
+        # On CPU-only hosts, fall back to gpus=0 so config validation still passes.
+        gpus = 1 if torch.cuda.is_available() else 0
+        model_name = "dummy"
+        skip_load_validation = True
+        auto_lr_find = False
+
+
+# ---------------------------------------------------------------------------
+# Dummy image model (always available — only depends on base lightning module)
+# ---------------------------------------------------------------------------
+
+
+@register_model
+class DummyZambaImageClassificationLightningModule(ZambaClassificationLightningModule):
+    """A dummy model whose linear weights start out as all zeros."""
+
+    _default_model_name = "dummy_model"
+
+    def __init__(
+        self,
+        in_features: int = 224 * 224 * 3,
+        num_hidden: int = 1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        backbone = torch.nn.Linear(in_features, num_hidden)
+        torch.nn.init.ones_(backbone.weight)
+        self.loss_fn = torch.nn.CrossEntropyLoss()
+
+        for param in backbone.parameters():
+            param.requires_grad = False
+
+        head = torch.nn.Linear(num_hidden, self.num_classes)
+        torch.nn.init.zeros_(head.weight)
+
+        self.backbone = backbone
+        self.head = head
+        self.model = torch.nn.Sequential(torch.nn.Flatten(), backbone, head)
+
+        self.save_hyperparameters("num_hidden")
+
+    def forward(self, x, *args, **kwargs):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y = torch.nn.functional.one_hot(y, num_classes=self.num_classes).to(torch.float)
+        y_hat = self.model(x)
+        loss = self.loss_fn(y_hat, y)
+        return loss
+
+    def _val_step(self, batch, batch_idx, subset):
+        x, y = batch
+        y = torch.nn.functional.one_hot(y, num_classes=self.num_classes).to(torch.float)
+
+        y_hat = self(x)
+        loss = self.loss_fn(y_hat, y)
+        self.log(f"{subset}_loss", loss.detach(), sync_dist=True, reduce_fx="mean")
+
+        return (
+            y.cpu().numpy().astype(int),
+            y_hat.cpu().numpy(),
+        )
+
+    def validation_step(self, batch, batch_idx):
+        output = self._val_step(batch, batch_idx, "val")
+        self.validation_step_outputs.append(output)
+        return output
+
+    def test_step(self, batch, batch_idx):
+        output = self._val_step(batch, batch_idx, "test")
+        self.test_step_outputs.append(output)
+
+        return output
+
+
+if _HAS_VIDEO:
+    MODEL_MAPPING["DummyZambaImageClassificationLightningModule"] = {
+        "transform": zamba_image_model_transforms()
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def labels_relative_path() -> os.PathLike:
+    return ASSETS_DIR / "labels.csv"
+
+
+@pytest.fixture(scope="session")
+def labels_json_relative_path() -> os.PathLike:
+    return ASSETS_DIR / "labels.csv"
+
+
+def labels_n_classes_df(n_classes):
+    """Get up a labels dataframe where the labels are up to
+    26 classes.
+    """
+    if n_classes > len(string.ascii_uppercase):
+        raise ValueError("n_classes must be less than 26")
+
+    choices = string.ascii_uppercase[:n_classes]
+
+    df = pd.read_csv(ASSETS_DIR / "labels.csv")
+    df.label = random.choices(choices, k=len(df))
+
+    return df
+
+
+@pytest.fixture(scope="session")
+def labels_absolute_path(tmp_path_factory) -> os.PathLike:
+    tmp_path = tmp_path_factory.mktemp("dummy-model-dir")
+    output_path = tmp_path / "labels.csv"
+    df = pd.read_csv(ASSETS_DIR / "labels.csv")
+    df["filepath"] = (str(TEST_VIDEOS_DIR) / df.filepath.path).path.resolve()
+    df.to_csv(output_path, index=False)
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def labels_no_splits(labels_absolute_path, tmp_path_factory) -> os.PathLike:
+    tmp_path = tmp_path_factory.mktemp("dummy-model-dir")
+    pd.read_csv(labels_absolute_path, usecols=["filepath", "label"]).to_csv(
+        tmp_path / "labels_no_splits.csv", index=False
+    )
+    return tmp_path / "labels_no_splits.csv"
+
+
+@pytest.fixture(scope="session")
+def filepaths(labels_absolute_path, tmp_path_factory) -> os.PathLike:
+    tmp_path = tmp_path_factory.mktemp("dummy-model-dir")
+    pd.read_csv(labels_absolute_path, usecols=["filepath"]).to_csv(
+        tmp_path / "filepaths.csv", index=False
+    )
+    return tmp_path / "filepaths.csv"
+
+
+# ---------------------------------------------------------------------------
+# Video-only fixtures (guarded behind _HAS_VIDEO)
+# ---------------------------------------------------------------------------
+if _HAS_VIDEO:
+
+    @pytest.fixture(scope="session")
+    def train_metadata(labels_absolute_path) -> pd.DataFrame:
+        return TrainConfig(labels=labels_absolute_path).labels
+
+    @pytest.fixture(scope="session")
+    def predict_metadata(filepaths) -> pd.DataFrame:
+        return PredictConfig(filepaths=filepaths, save=False).filepaths
+
+    @pytest.fixture(scope="session")
+    def time_distributed_checkpoint(labels_absolute_path) -> os.PathLike:
+        return TrainConfig(labels=labels_absolute_path, model_name="time_distributed").checkpoint
+
+    @pytest.fixture(scope="session")
+    def mdlite():
+        return MegadetectorLiteYoloX()
+
+    @pytest.fixture(scope="session")
+    def dummy_checkpoint(labels_absolute_path, tmp_path_factory) -> os.PathLike:
+        tmp_path = tmp_path_factory.mktemp("dummy-model-dir")
+        labels = pd.read_csv(labels_absolute_path)
+        species = list(labels.label.unique())
+        output_path = tmp_path / "dummy.ckpt"
+        DummyZambaVideoClassificationLightningModule(
+            num_frames=4, num_hidden=1, species=species
+        ).to_disk(output_path)
+        return output_path
+
+    @pytest.fixture(scope="session")
+    def dummy_train_config(labels_absolute_path, dummy_checkpoint, tmp_path_factory):
+        tmp_path = tmp_path_factory.mktemp("dummy-model-dir")
+        return DummyTrainConfig(
+            labels=labels_absolute_path,
+            data_dir=TEST_VIDEOS_DIR,
+            model_name="dummy",
+            checkpoint=dummy_checkpoint,
+            max_epochs=1,
+            batch_size=1,
+            auto_lr_find=False,
+            num_workers=2,
+            save_dir=tmp_path / "my_model",
+            skip_load_validation=True,
+        )
+
+    @pytest.fixture(scope="session")
+    def dummy_video_loader_config():
+        return VideoLoaderConfig(
+            total_frames=4, frame_selection_height=19, frame_selection_width=19
+        )
+
+    @pytest.fixture(scope="session")
+    def dummy_trainer(dummy_train_config, dummy_video_loader_config):
+        return train_model(
+            train_config=dummy_train_config,
+            video_loader_config=dummy_video_loader_config,
+        )
+
+    @pytest.fixture(scope="session")
+    def dummy_trained_model_checkpoint(dummy_trainer):
+        return next(iter((Path(dummy_trainer.logger.log_dir).glob("*.ckpt"))))
+
+
+# ---------------------------------------------------------------------------
+# General fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def caplog(_caplog):  # noqa: F811
+    """Used to test logging messages from loguru per:
+    https://loguru.readthedocs.io/en/stable/resources/migration.html#making-things-work-with-pytest-and-caplog
+    """
+
+    class PropogateHandler(logging.Handler):
+        def emit(self, record):
+            logging.getLogger(record.name).handle(record)
+
+    handler_id = logger.add(PropogateHandler(), format="{message} {extra}")
+    yield _caplog
+    logger.remove(handler_id)
