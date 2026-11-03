@@ -1,3 +1,4 @@
+<p align="center"><img alt="Python" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white"> <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ready-EE4C2C?style=flat-square&logo=pytorch&logoColor=white"> <img alt="Wildlife" src="https://img.shields.io/badge/Wildlife-conservation-2E7D32?style=flat-square"></p>
 # Zamba
 
 <!-- [![PyPI](https://img.shields.io/pypi/v/zamba.svg)](https://pypi.org/project/zamba/) -->
